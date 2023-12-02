@@ -1,0 +1,406 @@
+#!/usr/bin/python
+
+######################################################################
+#  A program for interactively mapping the xinput device to a
+#  rectangle on the screen.
+#
+#  2023-12-02 Sat
+#  Dov Grobgeld <dov.grobgeld@gmail.com>
+######################################################################
+
+from dataclasses import dataclass
+import gi
+gi.require_version('Gtk', '3.0')
+import cairo
+from gi.repository import Gtk, Gdk, GLib
+import re
+import socket
+import json
+import subprocess
+import sys
+import requests
+
+def die(msg):
+  sys.stderr.write(msg.strip('\n')+'\n')
+  sys.exit(-1)
+
+def xec(cmd, decode=True, chomp=True, verbose=False):
+  '''Run a command a returns its stdout output.
+
+  decode -- run (utf8) decode of the resulting string
+  chomp -- get rid of the last newline (like in perl)
+  '''
+  with subprocess.Popen(cmd,shell=True,stdout=subprocess.PIPE) as ph:
+    if verbose:
+      sys.stderr.write(cmd + '\n')
+    res = b''
+    maxsize = 1024
+    while True:
+      buf = ph.stdout.read()
+      if len(buf)==0:
+        break
+      res += buf
+    ph.wait()
+  if decode:
+    res=res.decode()
+  if chomp:
+    res = res[:-1]
+  return res
+
+@dataclass
+class Geom:
+  x : int = None
+  y : int = None
+  w : int = None
+  h : int = None
+
+def parse_x11_geometry(geom_string):
+  g = Geom()
+  if m:= re.match(r'(?:(\d+)x(\d+))?(?:([\+-]?\d+)([\+-]?\d+))?', geom_string):
+    g.w,g.h,g.x,g.y = [int(v) if v is not None else None
+                       for v in (m.group(1),m.group(2),m.group(3),m.group(4))]
+  else:
+     raise ValueError(f"Invalid X11 geometry string: {geom_string}")
+  return g
+
+#colors
+background = '#4b7e9b'
+foreground = '#00c5cd'
+
+def color_to_rgb(color_name :str):
+  if m:= re.search('^#(\w{2})(\w{2})(\w{2})', color_name):
+    return [int(m.group(i),16)/255 for i in (1,2,3)]
+  raise RuntimeError('Unsupported color')
+
+def key_to_gdkkey(key):
+  '''Interpret a string and turn it into a gdk keyval'''
+  if len(key)==1:
+    return ord(key)
+
+  keyval = {
+    'left':Gdk.KEY_Left,
+    'right':Gdk.KEY_Right,
+    'up':Gdk.KEY_Up,
+    'down':Gdk.KEY_Down,
+    }.get(key)
+
+  if keyval is None:
+    raise RuntimeError('Unknown key!')
+
+  return keyval
+
+# TBD: Extend this with additional known tablet name patterns
+known_devices_patterns = [
+  r'Wacom.*stylus']
+
+def get_device_name():
+  '''Query xinput and guess the tablet device name'''
+
+  for line in xec('xinput list').split('\n'):
+    if 'master' in line:
+      continue
+    if m:= re.search(r'^......(.*?)id=', line):
+      device_name = m.group(1).strip()
+
+      if any(re.search(p, device_name)
+             for p in known_devices_patterns):
+        return device_name
+  raise RuntimeError('No known device found')
+
+class MapperWidget(Gtk.DrawingArea):
+  '''Set the mapper widget.'''
+  def __init__(self, portrait, geom=None):
+    super().__init__()
+    self.device_name = get_device_name()
+    widget_width = 300 if (geom is None or geom.w is None) else geom.w
+    widget_height = int(9/16*widget_width) # assume wide screen
+    self.set_size_request(widget_width, widget_height)
+    self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+    self.connect('draw', self.on_draw)
+    self.aspect_ratio = (9/16)*3/4 if portrait else 1.0
+    self.mapping_pos = [0,0]
+    self.zoom=1.0
+    self.max_zoom = 2.0
+    self.dragging=False
+    self.draw_mapping_area()
+    
+    self.connect('button-press-event', self.on_button_press)
+    self.connect('button-release-event', self.on_button_release)
+    self.connect('motion-notify-event', self.on_motion_notify)
+    self.connect('scroll-event', self.on_scroll)
+
+    # Need this to get the mouse events
+    self.set_events(Gdk.EventMask.ALL_EVENTS_MASK
+                    | Gdk.EventMask.KEY_PRESS_MASK
+                    | Gdk.EventMask.KEY_RELEASE_MASK
+                    )
+
+    self.set_can_focus(True)
+    self.grab_focus()
+
+  def draw_mapping_area(self):
+    '''The the current mapping area'''
+    x,y = self.mapping_pos
+    w,h = 1.0/self.zoom * self.aspect_ratio, 1.0/self.zoom
+    self.set_rect(x,y,w,h)
+
+  def on_draw(self, area, cr):
+    '''Refresh the drawing according to the current "rect"'''
+    w,h = area.get_allocation().width, area.get_allocation().height
+    cr.set_source_rgb(*color_to_rgb(background))
+    cr.rectangle(0,0,w,h)
+    cr.fill()
+    cr.set_source_rgb(*color_to_rgb(foreground))
+    cr.rectangle(self.rect[0]*w, self.rect[1]*h,
+                 self.rect[2]*w, self.rect[3]*h)  # x,y,w,h
+    # Fill the rectangle with the source color
+    cr.fill()
+
+  def set_xinput_rect(self):
+    # Build the xinput command based on the current rect
+    # Assume portait mode. The following was build quite heuristically
+    
+    maxx = 1.0 - 1/self.zoom*self.aspect_ratio
+    maxy = 1.5 - 0.5/self.zoom
+    xix = self.rect[0]/maxx
+    xiy = self.rect[1]/maxy
+    matrix_string = (f'0 {-0.5/self.zoom} {0.5+0.5*xix:.4f} '
+                     f'{1.5/self.zoom} 0 {xiy:.4f} '
+                     f'0 0 1')
+#    print(f'{matrix_string}')
+    xec(f'xinput set-prop "{self.device_name}" --type=float "Coordinate Transformation Matrix" {matrix_string}')
+
+  def set_rect(self, x,y,w,h):
+    self.rect = (x,y,w,h)  # rect to draw
+    self.set_xinput_rect()
+    self.queue_draw()
+
+  def on_button_press(self, widget, event):
+    self.prev_mouse_x, self.prev_mouse_y = event.x, event.y
+    self.dragging = True
+
+  def on_button_release(self, widget, event):
+    self.dragging = False
+
+  def clip_mapping_pos(self):
+    if self.mapping_pos[0] < 0:
+      self.mapping_pos[0] = 0
+    if self.mapping_pos[0] > 1.0 - 1/self.zoom*self.aspect_ratio:
+      self.mapping_pos[0] = 1.0 - 1/self.zoom*self.aspect_ratio
+    if self.mapping_pos[1] < 0:
+      self.mapping_pos[1] = 0
+    if self.mapping_pos[1] > 1.0 - 1/self.zoom:
+      self.mapping_pos[1] = 1.0 - 1/self.zoom
+    
+  def on_motion_notify(self, widget, event):
+    if self.dragging:
+      mx,my = event.x - self.prev_mouse_x,event.y-self.prev_mouse_y
+      self.prev_mouse_x, self.prev_mouse_y = event.x, event.y
+
+      ww,wh = self.get_allocation().width, self.get_allocation().height
+      self.mapping_pos = [
+        self.mapping_pos[0] + mx/ww,
+        self.mapping_pos[1] + my/wh]
+
+      self.clip_mapping_pos()
+
+      self.draw_mapping_area()
+
+  def on_scroll(self, widget, event):
+    old_zoom = self.zoom
+    if event.delta_y==0:
+      return
+
+    if event.delta_y>0:
+      self.zoom *= 1.2
+    else:
+      self.zoom /= 1.2
+    if self.zoom > self.max_zoom:
+      self.zoom = self.max_zoom
+    elif self.zoom < 1.0:
+      self.zoom =1.0
+
+    # Adjust x to keep scrolled area in the middle
+    old_x,old_y = self.mapping_pos
+
+    # This is wrong!
+    dzoom = 1/old_zoom - 1/self.zoom 
+
+    self.mapping_pos = [
+      old_x + dzoom/2 * self.aspect_ratio,
+      old_y + dzoom/2]
+
+    self.clip_mapping_pos()
+    self.draw_mapping_area()
+
+  def handle_key(self, keyval):
+    w,h = self.rect[2],self.rect[3]
+    s = 0.2/self.zoom # "strength" of arrows
+    if keyval == ord('f'):
+      print('reset')
+      self.mapping_pos = [0,0]
+      self.zoom = 1.0
+    elif keyval == Gdk.KEY_Left:
+      self.mapping_pos[0] -= s*(1.0-w)
+      if self.mapping_pos[0] < 0:
+        self.mapping_pos[0] = 0
+    elif keyval == Gdk.KEY_Right:
+      self.mapping_pos[0] += s*(1.0-w)
+      if self.mapping_pos[0]+1.0/self.zoom*self.aspect_ratio > 1.0:
+        self.mapping_pos[0] = 1.0-1.0/self.zoom*self.aspect_ratio
+    elif keyval == Gdk.KEY_Up:
+      self.mapping_pos[1] -= s*(1.0-h)
+      if self.mapping_pos[1] < 0:
+        self.mapping_pos[1] = 0
+    elif keyval == Gdk.KEY_Down:
+      self.mapping_pos[1] += s*(1.0-h)
+      if self.mapping_pos[1]+1.0/self.zoom > 1.0:
+        self.mapping_pos[1] = 1.0-1.0/self.zoom
+    self.draw_mapping_area()
+
+  def do_key_press_event(self, event):
+    '''Handle key press events'''
+    if ((event.state & Gdk.ModifierType.CONTROL_MASK
+        and event.keyval == ord('q'))
+        or event.keyval == Gdk.KEY_Escape):
+      exit()
+    else:
+      self.handle_key(event.keyval)
+
+class SocketListener:
+  def __init__(self, port=8663, window=None):
+    self.port = port
+    self.window = window
+
+  def start_socket_listener(self):
+    HOST = "127.0.0.1"  # Standard loopback interface address (localhost)
+    
+    self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    self.server_socket.bind((HOST, self.port))
+    self.server_socket.listen()
+  
+    GLib.io_add_watch(self.server_socket.fileno(),
+                      GLib.IO_IN,
+                      self.handle_connection)
+    return True
+
+
+  def handle_connection(self, fd, flags):
+    conn, addr = self.server_socket.accept()
+    with conn:
+      while True:
+        data = conn.recv(1024)
+        if not data:
+            break
+
+        resp = ('HTTP/1.1 200 OK\n'
+                'Content-Type: application/json\n'
+                '\n'
+                '{ "res" : "ok" }')
+
+        conn.sendall(resp.encode())
+        break
+
+    # Assume we got all the data
+    try:
+      path, payload = self.decode_request(data)
+    except RuntimeError as exc:
+      return
+
+    try:
+      root = json.loads(payload)
+    except json.decoder.JSONDecodeError:
+      print(f'Failed json decoding payload: {payload}')
+      return True
+
+    # We support sending either strings or "raw" codes
+    command = root.get('command')
+    if command == 'scroll':
+      params = root.get('params')
+      key, = [params.get(v) for v in ('key',)]
+
+      self.window.handle_key(key_to_gdkkey(key))
+
+    conn.close()
+    return True
+        
+
+  def decode_request(self, data):
+    '''A simple http request decoder. Returns path and payload'''
+    print(f'{data=}')
+    m = re.search(r'POST (\S+)\s.(?:\S+)\r\n'
+                  r'.*'
+                  r'\r\n\r\n(.*)'
+                  ,
+                  data.decode(),
+                  re.DOTALL|re.MULTILINE
+                  )
+    if m:
+      return m.group(1), m.group(2)
+    raise RuntimeError('Failed matching patch!')
+
+def xtm_client(port, key):
+  payload = json.dumps(
+    {'command':'scroll',
+     'params':{
+       'key': key}})
+  response = requests.post(f'http://localhost:{port}', data=payload)
+
+def main():
+  import argparse
+
+  parser = argparse.ArgumentParser(description='Process a file')
+  parser.add_argument('-p', '--port',
+                      dest='port',
+                      action='store',
+                      type=int,
+                      default=8663,
+                      help='listener port')
+  parser.add_argument('-c', '--client',
+                      dest='do_client',
+                      action='store_true',
+                      help='Use client')
+  parser.add_argument('-k', '--key',
+                      dest='client_key',
+                      action='store',
+                      help='key to send for client')
+  parser.add_argument('-g', '--geometry',
+                      dest='geometry',
+                      action='store',
+                      help='key to send for client')
+  args = parser.parse_args()
+
+  if args.do_client:
+    if not args.client_key:
+      die('Must have key for client!')
+    xtm_client(port=args.port,
+               key=args.client_key)
+    exit()
+
+  window = Gtk.Window(title="XTabletMapper")
+  geom = None
+  if args.geometry is not None:
+    geom = parse_x11_geometry(args.geometry)
+  mapper_area = MapperWidget(portrait=True,
+                             geom = geom)
+  window.add(mapper_area) 
+ 
+  window.connect('destroy', Gtk.main_quit)
+  window.show_all() 
+  if geom is not None and geom.x is not None:
+    screen = Gdk.Screen.get_default()
+    alloc = window.get_allocation()
+    if geom.x < 0:
+      geom.x = screen.get_width() - alloc.width + geom.x
+    if geom.y < 0:
+      geom.y = screen.get_height() - alloc.height + geom.y
+    window.move(geom.x,geom.y)
+ 
+  sl = SocketListener(port=args.port,
+                      window = mapper_area)
+  sl.start_socket_listener()
+
+  Gtk.main()
+
+if __name__ == "__main__":
+    main()
