@@ -68,7 +68,7 @@ background = '#4b7e9b'
 foreground = '#00c5cd'
 
 def color_to_rgb(color_name :str):
-  if m:= re.search('^#(\w{2})(\w{2})(\w{2})', color_name):
+  if m:= re.search(r'^#(\w{2})(\w{2})(\w{2})', color_name):
     return [int(m.group(i),16)/255 for i in (1,2,3)]
   raise RuntimeError('Unsupported color')
 
@@ -122,6 +122,8 @@ class MapperWidget(Gtk.DrawingArea):
     self.zoom=1.0
     self.max_zoom = 2.0
     self.dragging=False
+    self.strength = 0.2 # For keyboard handling
+
     self.draw_mapping_area()
     
     self.connect('button-press-event', self.on_button_press)
@@ -233,9 +235,12 @@ class MapperWidget(Gtk.DrawingArea):
     self.clip_mapping_pos()
     self.draw_mapping_area()
 
-  def handle_key(self, keyval):
+  def handle_key(self, keyval, strength=None):
+    print(f'Handling key strength={strength}')
+    if strength is None:
+      strength = self.strength
     w,h = self.rect[2],self.rect[3]
-    s = 0.2/self.zoom # "strength" of arrows
+    s = strength/self.zoom # "strength" of arrows
     if keyval == ord('f'):
       print('reset')
       self.mapping_pos = [0,0]
@@ -265,7 +270,7 @@ class MapperWidget(Gtk.DrawingArea):
         or event.keyval == Gdk.KEY_Escape):
       exit()
     else:
-      self.handle_key(event.keyval)
+      self.handle_key(event.keyval, self.strength)
 
 class SocketListener:
   def __init__(self, port=8663, window=None):
@@ -317,9 +322,10 @@ class SocketListener:
     command = root.get('command')
     if command == 'scroll':
       params = root.get('params')
-      key, = [params.get(v) for v in ('key',)]
+      key,strength = [params.get(v) for v in ('key','strength')]
+      strength = float(strength)
 
-      self.window.handle_key(key_to_gdkkey(key))
+      self.window.handle_key(key_to_gdkkey(key), strength)
 
     conn.close()
     return True
@@ -339,11 +345,13 @@ class SocketListener:
       return m.group(1), m.group(2)
     raise RuntimeError('Failed matching patch!')
 
-def xtm_client(port, key):
+def xtm_client(port, key,strength):
   payload = json.dumps(
     {'command':'scroll',
      'params':{
-       'key': key}})
+       'key': key,
+       'strength' : strength
+     }})
   response = requests.post(f'http://localhost:{port}', data=payload)
 
 def main():
@@ -364,6 +372,11 @@ def main():
                       dest='client_key',
                       action='store',
                       help='key to send for client')
+  parser.add_argument('-s', '--strength',
+                      dest='strength',
+                      action='store',
+                      default=0.1,
+                      help='Strength of keys for scrolling')
   parser.add_argument('-g', '--geometry',
                       dest='geometry',
                       action='store',
@@ -374,7 +387,8 @@ def main():
     if not args.client_key:
       die('Must have key for client!')
     xtm_client(port=args.port,
-               key=args.client_key)
+               key=args.client_key,
+               strength=args.strength)
     exit()
 
   window = Gtk.Window(title="XTabletMapper")
